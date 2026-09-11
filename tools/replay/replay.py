@@ -31,6 +31,7 @@ from custom_components.helios_forecast.analog import AnalogSample, build_library
 from custom_components.helios_forecast.forecast import ForecastPoint, build_forecast_series  # noqa: E402
 from custom_components.helios_forecast.openmeteo import WeatherSeries  # noqa: E402
 from custom_components.helios_forecast.solar.geometry import sun_position  # noqa: E402
+from custom_components.helios_forecast.solar.irradiance import snow_cover_factor  # noqa: E402
 from custom_components.helios_forecast.solar.power import (  # noqa: E402
     PanelOrientation, PvLayout, WeatherSample, compute_pv_power_per_array,
 )
@@ -57,16 +58,23 @@ def load_weather() -> WeatherSeries:
             if mean is not None:
                 by_t.setdefault(int(start_ms), {})[field] = float(mean)
     times = sorted(by_t)
-    pick = lambda t, f, default: by_t[t].get(f, default)  # noqa: E731
+
+    def pick(t: int, field: str, legacy: str, default: float) -> float:
+        """The archive's own key since 2026.9.5, falling back to the entity-id spelling three of the
+        fields used before the migration, so a data/ pulled by an older fetch.mjs still loads."""
+        row = by_t[t]
+        value = row.get(field, row.get(legacy))
+        return float(value) if value is not None else default
+
     return WeatherSeries(
         times=[datetime.fromtimestamp(t / 1000, tz=timezone.utc) for t in times],
-        cloud=[pick(t, "cloud_cover", 0.0) for t in times],
-        shortwave=[pick(t, "global_irradiance", 0.0) for t in times],
-        direct=[pick(t, "direct_irradiance", 0.0) for t in times],
-        diffuse=[pick(t, "diffuse_irradiance", 0.0) for t in times],
-        temp=[pick(t, "temperature", 20.0) for t in times],
-        wind=[pick(t, "wind_speed", 0.0) for t in times],
-        snow=[pick(t, "snow_depth", 0.0) for t in times],
+        cloud=[pick(t, "cloud_cover", "cloud_cover", 0.0) for t in times],
+        shortwave=[pick(t, "ghi", "global_irradiance", 0.0) for t in times],
+        direct=[pick(t, "direct", "direct_irradiance", 0.0) for t in times],
+        diffuse=[pick(t, "diffuse", "diffuse_irradiance", 0.0) for t in times],
+        temp=[pick(t, "temperature", "temperature", 20.0) for t in times],
+        wind=[pick(t, "wind_speed", "wind_speed", 0.0) for t in times],
+        snow=[pick(t, "snow_depth", "snow_depth", 0.0) for t in times],
     )
 
 
@@ -77,6 +85,7 @@ def load_production() -> List[ProductionBucket]:
         if change is None or not math.isfinite(change) or change < 0:
             continue  # a meter reset reads as a huge negative hour; the integration skips it too
         out.append(ProductionBucket(start_ms=float(start_ms), end_ms=float(end_ms), kwh=float(change)))
+    out.sort(key=lambda b: b.start_ms)  # the accumulator below folds in time order and never looks back
     return out
 
 
@@ -240,6 +249,185 @@ def vertical_map(inp: SkyResidualInput) -> Optional[SkyResidualMap]:
     return replace(raw, m=m_s, conf=c_s)
 
 
+# ---- a variant of where the map's memory lives ---------------------------------------------------
+#
+# The integration rebuilds the residual map from a 60-day window on every refresh, because that is
+# all Open-Meteo serves. But near-field shading is a property of the sun's angles, which recur every
+# year, and the archived weather is not capped at 60 days: the integration writes it to its own
+# long-term statistics precisely so the history grows without bound. Nothing reads it back yet.
+#
+# What is measured here is whether a map that REMEMBERS pays: per sky cell, the sufficient statistics
+# a Store would hold (a weight and a weighted sum), decayed with a half-life of a year instead of a
+# month, folded forward once per bucket and never re-read. Three properties make it more than a
+# wider window:
+#
+#   - the stored ratio is NORMALISED by the site's global ratio at the time it was observed, so it
+#     carries the SHAPE of the sky and not the level. A panel wash, soiling or a thermal-model
+#     correction moves the level, which stays on the integration's own 30-day recency, and leaves a
+#     year-old shadow where it was.
+#   - each cell's weight saturates at CELL_W_MAX, which is what decides how many contradicting hours
+#     it takes to unlearn a tree that was cut down. Uncapped, the memory is unbounded and a felled
+#     tree stays in the forecast for ever.
+#   - it is folded incrementally, in time order, exactly as a coordinator would fold one refresh:
+#     O(1) work per new hour, no re-reading of history. The replay does the same so what it measures
+#     is what would run.
+
+LONG_HALF_LIFE_DAYS = 365.0
+CELL_W_MAX = 40.0
+
+
+def model_kwh_of(b: ProductionBucket, weather: WeatherSeries, epochs: List[float]) -> Optional[float]:
+    """The physical model's kWh over one bucket, mirroring build_sky_residual_map: the nearest weather
+    hour, four sub-samples, per-array caps then the entry cap, averaged over the WHOLE bucket."""
+    mid = (b.start_ms + b.end_ms) / 2.0
+    i = _nearest(epochs, mid)
+    cloud = weather.cloud[i]
+    cloud = max(0.0, min(100.0, cloud)) if (cloud is not None and math.isfinite(cloud)) else 0.0
+    sample = WeatherSample(cloud=cloud, ghi=weather.shortwave[i], direct=weather.direct[i],
+                           diffuse=weather.diffuse[i], temp=weather.temp[i], wind=weather.wind[i])
+    snow = snow_cover_factor(weather.snow[i], sample.temp)
+    k = LAYOUT.total_kwp * 10.0
+    total = 0.0
+    seen = 0
+    for j in range(RS.LEARN_SUBSAMPLES):
+        sub = b.start_ms + (j + 0.5) * (b.end_ms - b.start_ms) / RS.LEARN_SUBSAMPLES
+        moment = datetime.fromtimestamp(sub / 1000.0, tz=timezone.utc)
+        if sun_position(moment, LAT, LON).altitude <= 0:
+            continue
+        pcts = compute_pv_power_per_array(moment, LAT, LON, sample, LAYOUT)
+        total += min(CAP_W, RS.capped_model_kwh(pcts, LAYOUT, k, snow) * 1000.0) / 1000.0
+        seen += 1
+    return total / RS.LEARN_SUBSAMPLES if seen else None
+
+
+class SkyAccumulator:
+    """Per sky cell: the weight and the weighted sum of the normalised ratio, plus the instant each
+    cell was last folded (the decay is applied lazily, per cell, on the next touch)."""
+
+    def __init__(self, half_life_days: float = LONG_HALF_LIFE_DAYS, w_max: float = CELL_W_MAX) -> None:
+        n = RS.N_AZ * RS.N_ALT
+        self.w = [0.0] * n
+        self.wr = [0.0] * n
+        self.t = [0.0] * n
+        self.hl_ms = half_life_days * 86400e3
+        self.w_max = w_max
+        # The running site level: the integration's own 30-day half-life, energy-weighted the way
+        # build_sky_residual_map weights its global fallback. Causal by construction, since folding
+        # only ever moves forwards.
+        self.g_w = 0.0
+        self.g_wr = 0.0
+        self.g_t = 0.0
+
+    @property
+    def global_ratio(self) -> float:
+        return self.g_wr / self.g_w if self.g_w > 0 else 1.0
+
+    def fold(self, b: ProductionBucket, weather: WeatherSeries, epochs: List[float]) -> None:
+        """Fold one measured hour in. Every guard is build_sky_residual_map's, in the same order."""
+        kwh = b.kwh
+        if not math.isfinite(kwh) or kwh < 0:
+            return
+        if RS.implausible_hour(kwh, b.start_ms, b.end_ms, LAYOUT.total_kwp):
+            return
+        mid = (b.start_ms + b.end_ms) / 2.0
+        sun = sun_position(datetime.fromtimestamp(mid / 1000.0, tz=timezone.utc), LAT, LON)
+        if sun.altitude <= 0:
+            return
+        model = model_kwh_of(b, weather, epochs)
+        if model is None or model < RS.MODEL_KWH_FLOOR:
+            return
+        if b.curtailed and kwh < model:
+            return  # right-censored: the inverter set this figure, not the sky
+        ratio = kwh / model
+        if not math.isfinite(ratio) or ratio < 0:
+            return
+
+        i = _nearest(epochs, mid)
+        cloud = weather.cloud[i]
+        cloud = max(0.0, min(100.0, cloud)) if (cloud is not None and math.isfinite(cloud)) else 0.0
+        clear = max(0.1, 1 - cloud / 100)
+
+        # Level first, so the shape stored below is measured against the site as it was that week.
+        decay_g = math.pow(0.5, max(0.0, mid - self.g_t) / RS.RECENCY_HALF_LIFE_MS) if self.g_t else 1.0
+        self.g_w = self.g_w * decay_g + clear * model
+        self.g_wr = self.g_wr * decay_g + clear * model * ratio
+        self.g_t = mid
+        g = self.global_ratio
+        if not (g > 0):
+            return
+
+        idx = (min(RS.N_ALT - 1, max(0, math.floor(sun.altitude / RS.ALT_STEP_DEG))) * RS.N_AZ
+               + min(RS.N_AZ - 1, max(0, math.floor((sun.azimuth % 360) / RS.AZ_STEP_DEG))))
+        decay = math.pow(0.5, max(0.0, mid - self.t[idx]) / self.hl_ms) if self.t[idx] else 1.0
+        w = self.w[idx] * decay + clear
+        wr = self.wr[idx] * decay + clear * (ratio / g)
+        if w > self.w_max:
+            # Both sides scaled together: the cap bounds the memory without disturbing the mean it holds.
+            wr *= self.w_max / w
+            w = self.w_max
+        self.w[idx], self.wr[idx], self.t[idx] = w, wr, mid
+
+    def visited(self) -> int:
+        return sum(1 for w in self.w if w > 0)
+
+
+def _smooth(m: List[float], conf: List[float]) -> tuple:
+    """build_sky_residual_map's own thin-cell smoothing, lifted so the long map is judged on the same
+    terms as the short one rather than on the absence of a step the integration performs."""
+    m_s, c_s = list(m), list(conf)
+    for aj in range(RS.N_ALT):
+        for ai in range(RS.N_AZ):
+            idx = aj * RS.N_AZ + ai
+            self_conf = conf[idx]
+            if self_conf >= RS.SMOOTH_CONF_KEEP:
+                continue
+            num = den = best = 0.0
+            for d_alt in (-1, 0, 1):
+                nj = aj + d_alt
+                if nj < 0 or nj >= RS.N_ALT:
+                    continue
+                for d_az in (-1, 0, 1):
+                    if d_alt == 0 and d_az == 0:
+                        continue
+                    n_idx = nj * RS.N_AZ + (ai + d_az + RS.N_AZ) % RS.N_AZ
+                    c = conf[n_idx]
+                    num += c * m[n_idx]
+                    den += c
+                    best = max(best, c)
+            if den <= 0 or best <= 0:
+                continue
+            pull = RS.SMOOTH_NEIGHBOR_W * best
+            m_s[idx] = (self_conf * m[idx] + pull * (num / den)) / (self_conf + pull)
+            c_s[idx] = min(1.0, self_conf + pull)
+    return m_s, c_s
+
+
+def long_map(acc: SkyAccumulator, now_ms: float, short: Optional[SkyResidualMap]) -> Optional[SkyResidualMap]:
+    """The accumulator read as a SkyResidualMap: the remembered SHAPE, scaled by the level the short
+    60-day window reports today. wr/w is decay-invariant, so only the confidence needs bringing to now."""
+    g = short.global_ratio if short is not None else acc.global_ratio
+    if not (g > 0):
+        return None
+    n = RS.N_AZ * RS.N_ALT
+    m = [g] * n
+    conf = [0.0] * n
+    visited = 0
+    total_w = 0.0
+    for i in range(n):
+        if acc.w[i] <= 0:
+            continue
+        m[i] = max(RS.M_MIN, min(RS.M_MAX, acc.wr[i] / acc.w[i] * g))
+        w_now = acc.w[i] * math.pow(0.5, max(0.0, now_ms - acc.t[i]) / acc.hl_ms)
+        conf[i] = 1 - math.exp(-w_now / RS.CONF_W0)
+        total_w += w_now
+        visited += 1
+    if total_w < RS.MIN_TOTAL_WEIGHT:
+        return None
+    m_s, c_s = _smooth(m, conf)
+    return SkyResidualMap(n_az=RS.N_AZ, n_alt=RS.N_ALT, m=m_s, conf=c_s, global_ratio=g,
+                          total_weight=total_w, visited_cells=visited)
+
+
 # ---- the replay ------------------------------------------------------------------------------------
 
 BANDS = ["AM 0-15", "AM 15-30", "AM 30+", "PM 30+", "PM 15-30", "PM 0-15"]
@@ -251,7 +439,7 @@ def band_of(sun) -> str:
     return "%s %s" % (half, "0-15" if alt < 15 else ("15-30" if alt < 30 else "30+"))
 
 
-def replay(days: int) -> None:
+def replay(days: int, half_life: float = LONG_HALF_LIFE_DAYS, cap: float = CELL_W_MAX) -> None:
     weather = load_weather()
     epochs = [t.timestamp() * 1000.0 for t in weather.times]
     buckets = load_production()
@@ -260,11 +448,21 @@ def replay(days: int) -> None:
     first = last_full - timedelta(days=days)
 
     VARIANTS = ["physique", "residuel seul", "pipeline actuel", "pipeline 2026.9.2 (watts)", "analogues azimut pese", "analogues sur ratios",
-                "ratios + azimut pese", "lissage vertical seul", "vertical + pipeline", "vertical + ratios + azimut"]
-    acc = {v: {b: {"n": 0, "abs": 0.0, "pred": 0.0, "truth": 0.0} for b in BANDS + ["total"]} for v in VARIANTS}
+                "ratios + azimut pese", "lissage vertical seul", "vertical + pipeline", "vertical + ratios + azimut",
+                "memoire longue seule", "memoire longue + pipeline"]
+    acc_stats = {v: {b: {"n": 0, "abs": 0.0, "pred": 0.0, "truth": 0.0} for b in BANDS + ["total"]} for v in VARIANTS}
     daily = {v: [] for v in VARIANTS}
     band_cov = {v: [0, 0] for v in VARIANTS}
     w_epochs = analog.series_epochs(weather.times)
+
+    # One accumulator for the whole run, folded forward as the days go by: each measured hour is
+    # folded exactly once, the way a coordinator would fold it at the refresh that first saw it.
+    # Everything before the first replayed day is the warm-up, and it is free: those hours would
+    # have been folded then too.
+    acc = SkyAccumulator(half_life_days=half_life, w_max=cap)
+    folded = 0
+    coverage = [0, 0]  # cells the long map holds vs cells the 60-day map holds, summed over the days
+    n_days = 0
 
     day = first
     while day < last_full:
@@ -275,16 +473,30 @@ def replay(days: int) -> None:
             day += timedelta(days=1)
             continue
         inp = SkyResidualInput(
-            lat=LAT, lon=LON, layout=LAYOUT, production=history, cloud_times=epochs, cloud=weather.cloud,
+            lat=LAT, lon=LON, layout=LAYOUT, production=history, inverter_max_w=CAP_W,
+            cloud_times=epochs, cloud=weather.cloud,
             shortwave=weather.shortwave, direct=weather.direct, diffuse=weather.diffuse, temp=weather.temp,
             wind=weather.wind, snow=weather.snow, now_ms=now_ms)
         sky = build_sky_residual_map(inp)
         vsky = vertical_map(inp)
+        while folded < len(buckets) and buckets[folded].end_ms <= now_ms:
+            acc.fold(buckets[folded], weather, epochs)
+            folded += 1
+        lsky = long_map(acc, now_ms, sky)
+        if sky is not None:
+            # Cells confident enough to speak for themselves. A cell merely VISITED says little: below
+            # SMOOTH_CONF_KEEP the smoothing overwrites it with its neighbours, which is exactly what
+            # erases a shadow, so counting visits would report a memory the map does not actually have.
+            firm = lambda mp: sum(1 for c in mp.conf if c >= RS.SMOOTH_CONF_KEEP)  # noqa: E731
+            coverage[0] += firm(lsky) if lsky is not None else 0
+            coverage[1] += firm(sky)
         start, end = day, day + timedelta(days=1)
         base = build_forecast_series(weather, LAYOUT, LAT, LON, inverter_max_w=CAP_W, start=start, end=end,
                                      step_minutes=15, residual_map=sky)
         vbase = build_forecast_series(weather, LAYOUT, LAT, LON, inverter_max_w=CAP_W, start=start, end=end,
                                       step_minutes=15, residual_map=vsky)
+        lbase = build_forecast_series(weather, LAYOUT, LAT, LON, inverter_max_w=CAP_W, start=start, end=end,
+                                      step_minutes=15, residual_map=lsky)
         library = build_library(history, weather, LAT, LON, LAYOUT, CAP_W)  # the integration's own call, ratios included
         watts_library = build_library(history, weather, LAT, LON)  # the pre-2026.9.3 library, watts only
         rlib = ratio_library(history, weather, epochs)
@@ -300,6 +512,8 @@ def replay(days: int) -> None:
             "lissage vertical seul": vbase,
             "vertical + pipeline": enrich_points(vbase, library, weather, LAT, LON, now),
             "vertical + ratios + azimut": enrich_variant(vbase, rlib, weather, w_epochs, now, ratio_lib=True, **AZ),
+            "memoire longue seule": lbase,
+            "memoire longue + pipeline": enrich_points(lbase, library, weather, LAT, LON, now),
         }
         for name, pts in series.items():
             by_hour: Dict[int, List[ForecastPoint]] = {}
@@ -315,7 +529,7 @@ def replay(days: int) -> None:
                 pred_w = sum(p.pv_w for p in group) / len(group)
                 truth_w = truth * 1000.0
                 for key in (band_of(sun), "total"):
-                    a = acc[name][key]
+                    a = acc_stats[name][key]
                     a["n"] += 1; a["abs"] += abs(pred_w - truth_w); a["pred"] += pred_w; a["truth"] += truth_w
                 day_pred += pred_w / 1000; day_truth += truth
                 lo = [p.pv_p10 for p in group if p.pv_p10 is not None]
@@ -325,19 +539,25 @@ def replay(days: int) -> None:
                     band_cov[name][0] += (min(lo) <= truth_w <= max(hi))
             if day_truth > 0.3:
                 daily[name].append((day_pred - day_truth) / day_truth * 100)
+        n_days += 1
         day += timedelta(days=1)
 
+    n_days = max(1, n_days)
     print("Replay on %d days, hourly, sun up, meter above zero. Per cell: nMAE (W/kWc) and bias; last column: mean absolute error on the day's energy." % days)
     print("%-27s" % "" + "".join("%11s" % b for b in BANDS) + "%11s %8s" % ("TOTAL", "jour"))
     for v in VARIANTS:
         cells = []
         for b in BANDS + ["total"]:
-            a = acc[v][b]
+            a = acc_stats[v][b]
             cells.append("%3.0f %+4.0f%%" % (a["abs"] / a["n"] / LAYOUT.total_kwp, 100 * (a["pred"] - a["truth"]) / a["truth"]) if a["n"] else "    -    ")
         d = daily[v]
         mape = sum(abs(x) for x in d) / len(d) if d else float("nan")
         print("%-27s" % v + "".join("%11s" % c for c in cells) + "%8s" % ("%.1f%%" % mape))
-    print("  n par cellule : " + " ".join("%s=%d" % (b, acc["physique"][b]["n"]) for b in BANDS))
+    print("  n par cellule : " + " ".join("%s=%d" % (b, acc_stats["physique"][b]["n"]) for b in BANDS))
+    if coverage[1]:
+        print("\nCellules du ciel sures d'elles (conf >= %.1f), moyenne par jour : memoire longue %.0f, "
+              "fenetre 60 jours %.0f (demi-vie %.0f j, plafond %.0f)."
+              % (RS.SMOOTH_CONF_KEEP, coverage[0] / n_days, coverage[1] / n_days, half_life, cap))
     print("\nCouverture de la fourchette P10-P90 (objectif 80 %) :")
     for v in VARIANTS:
         hit, n = band_cov[v]
@@ -348,5 +568,9 @@ def replay(days: int) -> None:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=30)
+    ap.add_argument("--half-life", type=float, default=LONG_HALF_LIFE_DAYS,
+                    help="the long map's per-cell half-life in days (the integration's own is 30)")
+    ap.add_argument("--cap", type=float, default=CELL_W_MAX,
+                    help="per-cell weight ceiling: how fast a felled tree can be unlearned")
     args = ap.parse_args()
-    replay(args.days)
+    replay(args.days, args.half_life, args.cap)
